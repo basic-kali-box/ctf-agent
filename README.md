@@ -89,6 +89,32 @@ This opens an interactive menu. Pick a command or pass arguments directly:
 
 ---
 
+## Readying the CTF Agent
+
+To ensure the agent is competition-ready, follow this checklist:
+
+1.  **Verify Tooling**: The agent relies on external binaries for exploitation and analysis. Run the probe command to check your environment:
+    ```bash
+    ./start.sh probe
+    ```
+    Ensure `radare2`, `gdb`, `ltrace`, and `strings` are found.
+
+2.  **Initialize Knowledge Base**: If this is a fresh install, populate the RAG database with common exploitation techniques:
+    ```bash
+    ./start.sh how2heap
+    ./start.sh hacktricks
+    ```
+
+3.  **Check API Connectivity**: Ensure your `.env` is correctly configured. The hybrid backend requires three providers to be functional.
+
+4.  **Test Run**: Run a simple "hello world" challenge to verify the loop:
+    ```bash
+    ./start.sh agent "print 'Hello world' in python" --category misc
+    ```
+
+
+---
+
 ## Backends
 
 | Flag | Model | Notes |
