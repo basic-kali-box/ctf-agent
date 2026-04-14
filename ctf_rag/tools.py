@@ -442,11 +442,10 @@ TOOL_SCHEMAS.append({
 TOOL_SCHEMAS.append({
     "name": "gdb_analyze",
     "description": (
-        "Run a native ELF binary in GDB with an input payload, catching crashes to return "
-        "RIP/PC and registers. For native (x86/x86_64) binaries only. "
-        "For ARM binaries: use shell_exec with "
-        "'qemu-arm -g 1234 -L <rootfs> ./binary &' then 'gdb-multiarch -ex \"target remote :1234\"', "
-        "or use angr_solve(arch='ARM') for symbolic execution instead."
+        "Quick GDB crash analysis: run a binary with a payload and return registers + backtrace on crash. "
+        "For simple offset finding only. "
+        "For anything more complex (breakpoints, memory inspection, step-through), use gdb_script instead. "
+        "For ARM binaries use angr_solve(arch='ARM') or qemu_gdb."
     ),
     "parameters": {"type": "object", "properties": {"binary": {"type": "string"}, "payload": {"type": "string"}}, "required": ["binary", "payload"]}
 })
@@ -639,6 +638,80 @@ TOOL_SCHEMAS.append({
             "function": {"type": "string", "description": "Function name to focus on (default: 'main'). Use 'all' for top 10 functions."},
         },
         "required": ["binary"],
+    },
+})
+
+TOOL_SCHEMAS.append({
+    "name": "find_xrefs",
+    "description": (
+        "Find all cross-references (callers, data refs) to a symbol or address in a binary. "
+        "Use to answer: 'what calls check_password()?', 'where is this string used?', "
+        "'which functions reference this global?'. "
+        "symbol can be a function name (e.g. 'sym.verify') or hex address (e.g. '0x401234'). "
+        "Returns caller address, calling function, and instruction for each xref. "
+        "Much cheaper than dumping entire decompilation — use this FIRST to map call graph."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "binary": {"type": "string", "description": "Path to the ELF binary"},
+            "symbol": {"type": "string", "description": "Function name, symbol (e.g. 'sym.check'), or hex address (e.g. '0x401234')"},
+        },
+        "required": ["binary", "symbol"],
+    },
+})
+
+TOOL_SCHEMAS.append({
+    "name": "get_function_cfg",
+    "description": (
+        "Get the Control Flow Graph (CFG) of a function as ASCII art. "
+        "Shows all basic blocks, conditional branches, and loop structure without dumping full assembly. "
+        "Use to understand: loop conditions, if/else chains, state machine transitions. "
+        "func_name can be 'main', 'sym.verify_key', or a hex address like '0x401234'. "
+        "For large functions, set max_blocks to limit output (default 40 blocks)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "binary":    {"type": "string",  "description": "Path to the ELF binary"},
+            "func_name": {"type": "string",  "description": "Function name or hex address"},
+            "max_blocks":{"type": "integer", "description": "Max basic blocks to show (default 40, set lower for huge functions)"},
+        },
+        "required": ["binary", "func_name"],
+    },
+})
+
+TOOL_SCHEMAS.append({
+    "name": "gdb_script",
+    "description": (
+        "Run an arbitrary sequence of GDB commands against a binary in a single batch session. "
+        "Replaces gdb_analyze for any non-trivial debugging: set breakpoints, examine memory, "
+        "inspect registers mid-execution, call functions, patch bytes, and continue — all in one shot. "
+        "gdb_commands is a list of GDB command strings executed in order. "
+        "The session captures all GDB output and returns it. "
+        "Examples:\n"
+        "  # Catch crash and inspect stack\n"
+        "  gdb_script(binary='./chall', stdin_input='A'*200,\n"
+        "    gdb_commands=['run', 'info registers', 'x/20gx $rsp', 'backtrace'])\n"
+        "  # Breakpoint at specific address, inspect state\n"
+        "  gdb_script(binary='./chall', args=['solve'],\n"
+        "    gdb_commands=['break *0x401234', 'run', 'info registers', 'x/s $rdi', 'continue'])\n"
+        "  # Find offset by catching SIGSEGV\n"
+        "  gdb_script(binary='./chall', stdin_input='AAAABBBBCCCCDDDD',\n"
+        "    gdb_commands=['run', 'p/x $rip', 'p/x $rbp'])"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "binary":       {"type": "string",  "description": "Path to the ELF binary"},
+            "gdb_commands": {"type": "array",   "items": {"type": "string"},
+                             "description": "GDB commands to run in order (e.g. ['break main', 'run', 'info registers'])"},
+            "stdin_input":  {"type": "string",  "description": "Data to feed to the binary's stdin (sent before GDB prompt)"},
+            "args":         {"type": "array",   "items": {"type": "string"},
+                             "description": "Command-line arguments for the binary (e.g. ['--flag', 'input.txt'])"},
+            "timeout":      {"type": "integer", "description": "Seconds before killing GDB (default 30)"},
+        },
+        "required": ["binary", "gdb_commands"],
     },
 })
 
@@ -1479,6 +1552,12 @@ def _dispatch(name: str, args: dict, session) -> str:
         return _foundry_run(**args, session=session)
     elif name == "android_analyze":
         return _android_analyze(**args, session=session)
+    elif name == "find_xrefs":
+        return _find_xrefs(**args)
+    elif name == "get_function_cfg":
+        return _get_function_cfg(**args)
+    elif name == "gdb_script":
+        return _gdb_script(**args)
     else:
         return f"[error] Unknown tool: {name}"
 
@@ -1517,6 +1596,123 @@ def _r2_analyze(binary: str, command: str) -> str:
     if needs_analysis and not result.strip():
         result = _shell_exec(f'r2 -A -q -e scr.color=0 -c "{safe_cmd_escaped};q" {binary_q} 2>/dev/null', timeout=90)
 
+    return result
+
+
+def _find_xrefs(binary: str, symbol: str) -> str:
+    """Find all cross-references to a symbol/address using radare2 axt."""
+    import shlex as _shlex
+    binary_q = _shlex.quote(binary)
+    # axt works on addresses; for named symbols try the sym. prefix if bare name given
+    sym = symbol if symbol.startswith(("0x", "sym.", "fcn.", "sub.")) else f"sym.{symbol}"
+    cmd = f'aaa;axt {sym}'
+    cmd_escaped = cmd.replace('"', '\\"')
+    result = _shell_exec(f'r2 -q -e scr.color=0 -c "{cmd_escaped};q" {binary_q} 2>/dev/null', timeout=60)
+    if not result.strip():
+        # Try bare name (works for imports like printf, strcmp)
+        cmd2 = f'aaa;axt {symbol}'
+        cmd2_escaped = cmd2.replace('"', '\\"')
+        result = _shell_exec(f'r2 -q -e scr.color=0 -c "{cmd2_escaped};q" {binary_q} 2>/dev/null', timeout=60)
+    if not result.strip():
+        return f"[find_xrefs] No cross-references found for '{symbol}'. Try r2_analyze with 'axt {symbol}' after aaa."
+    return f"[xrefs to {symbol}]\n{result}"
+
+
+def _get_function_cfg(binary: str, func_name: str, max_blocks: int = 40) -> str:
+    """Return ASCII control-flow graph for a function using radare2 agfd."""
+    import shlex as _shlex
+    binary_q = _shlex.quote(binary)
+    # agft = ASCII graph of function (text); agfd = dotfile; use agft for terminal-readable output
+    target = func_name if func_name.startswith(("0x", "sym.", "fcn.", "sub.")) else f"sym.{func_name}"
+    # agft @ <func> prints the CFG as ASCII boxes
+    cmd = f'aaa;agft @ {target}'
+    cmd_escaped = cmd.replace('"', '\\"')
+    result = _shell_exec(f'r2 -q -e scr.color=0 -e graph.maxdepth={max_blocks} -c "{cmd_escaped};q" {binary_q} 2>/dev/null', timeout=60)
+    if not result.strip():
+        # Fallback: try bare name
+        cmd2 = f'aaa;agft @ {func_name}'
+        cmd2_escaped = cmd2.replace('"', '\\"')
+        result = _shell_exec(f'r2 -q -e scr.color=0 -e graph.maxdepth={max_blocks} -c "{cmd2_escaped};q" {binary_q} 2>/dev/null', timeout=60)
+    if not result.strip():
+        return f"[get_function_cfg] CFG empty for '{func_name}'. Use r2_analyze with 'aaa;agft @ {func_name}' or check the function name with 'afl'."
+    # Limit output length so huge CFGs don't blow context
+    lines = result.splitlines()
+    if len(lines) > 300:
+        result = "\n".join(lines[:300]) + f"\n... [{len(lines)-300} lines truncated — use max_blocks to reduce]"
+    return f"[CFG: {func_name}]\n{result}"
+
+
+def _gdb_script(
+    binary: str,
+    gdb_commands: list,
+    stdin_input: str = "",
+    args: list = None,
+    timeout: int = 30,
+) -> str:
+    """
+    Run a GDB batch session with arbitrary commands.
+    Much more powerful than gdb_analyze — supports breakpoints, memory inspection,
+    stepping, calling functions, and reading registers at any point.
+    """
+    import shlex as _shlex
+    import tempfile, os, textwrap
+
+    if not gdb_commands:
+        return "[error] gdb_script requires at least one gdb_command."
+
+    binary_q = _shlex.quote(binary)
+    arg_str = " ".join(_shlex.quote(a) for a in (args or []))
+
+    # Write stdin payload to a temp file if provided
+    stdin_file = ""
+    if stdin_input:
+        with tempfile.NamedTemporaryFile(mode="wb", suffix=".bin", delete=False) as f:
+            # Support Python escape sequences in stdin_input
+            try:
+                payload = bytes(stdin_input, "utf-8").decode("unicode_escape").encode("latin-1")
+            except Exception:
+                payload = stdin_input.encode("latin-1", errors="replace")
+            f.write(payload)
+            stdin_file = f.name
+
+    # Build GDB script file
+    script_lines = ["set pagination off", "set confirm off"]
+    if stdin_file:
+        script_lines.append(f"set args {arg_str}")
+        # Redirect stdin for `run`
+        run_redir = f"< {stdin_file}"
+    else:
+        script_lines.append(f"set args {arg_str}")
+        run_redir = ""
+
+    for cmd in gdb_commands:
+        # Inject stdin redirect into `run` commands automatically
+        if cmd.strip().lower().startswith("run") and run_redir and run_redir not in cmd:
+            script_lines.append(f"{cmd} {run_redir}")
+        else:
+            script_lines.append(cmd)
+
+    script_lines.append("quit")
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".gdb", delete=False) as f:
+        f.write("\n".join(script_lines) + "\n")
+        script_file = f.name
+
+    try:
+        result = _shell_exec(
+            f"gdb -q -nw -batch -x {_shlex.quote(script_file)} {binary_q} 2>&1",
+            timeout=timeout,
+        )
+    finally:
+        os.unlink(script_file)
+        if stdin_file:
+            try:
+                os.unlink(stdin_file)
+            except OSError:
+                pass
+
+    if not result.strip():
+        return "[gdb_script] No output returned. Check the binary path and GDB commands."
     return result
 
 
