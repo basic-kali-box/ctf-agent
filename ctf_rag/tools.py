@@ -1600,45 +1600,95 @@ def _r2_analyze(binary: str, command: str) -> str:
 
 
 def _find_xrefs(binary: str, symbol: str) -> str:
-    """Find all cross-references to a symbol/address using radare2 axt."""
+    """Find all cross-references to a symbol/address using radare2 axt.
+
+    Tries multiple symbol prefixes (sym., dbg., bare) so the caller
+    doesn't need to know the exact r2 namespace for the binary type.
+    """
     import shlex as _shlex
     binary_q = _shlex.quote(binary)
-    # axt works on addresses; for named symbols try the sym. prefix if bare name given
-    sym = symbol if symbol.startswith(("0x", "sym.", "fcn.", "sub.")) else f"sym.{symbol}"
-    cmd = f'aaa;axt {sym}'
-    cmd_escaped = cmd.replace('"', '\\"')
-    result = _shell_exec(f'r2 -q -e scr.color=0 -c "{cmd_escaped};q" {binary_q} 2>/dev/null', timeout=60)
-    if not result.strip():
-        # Try bare name (works for imports like printf, strcmp)
-        cmd2 = f'aaa;axt {symbol}'
-        cmd2_escaped = cmd2.replace('"', '\\"')
-        result = _shell_exec(f'r2 -q -e scr.color=0 -c "{cmd2_escaped};q" {binary_q} 2>/dev/null', timeout=60)
-    if not result.strip():
-        return f"[find_xrefs] No cross-references found for '{symbol}'. Try r2_analyze with 'axt {symbol}' after aaa."
-    return f"[xrefs to {symbol}]\n{result}"
+
+    def _run_axt(target: str) -> str:
+        cmd = f'aaa;axt {target}'
+        cmd_esc = cmd.replace('"', '\\"')
+        out = _shell_exec(f'r2 -q -e scr.color=0 -c "{cmd_esc};q" {binary_q} 2>/dev/null', timeout=60)
+        # Strip wrapper lines added by _shell_exec
+        lines = [l for l in out.splitlines() if not l.startswith("[CWD") and "exit 0" not in l and l.strip()]
+        return "\n".join(lines)
+
+    # Build candidate list
+    if symbol.startswith(("0x", "sym.", "fcn.", "sub.", "dbg.", "imp.")):
+        candidates = [symbol]
+    else:
+        candidates = [f"sym.{symbol}", f"dbg.{symbol}", f"sym.imp.{symbol}", symbol]
+
+    for candidate in candidates:
+        result = _run_axt(candidate)
+        if result.strip():
+            return f"[xrefs to {symbol}]\n{result}"
+
+    return (
+        f"[find_xrefs] No cross-references found for '{symbol}'. "
+        f"Check symbol name with r2_analyze(binary, 'aaa;afl') or 'ii' for imports."
+    )
 
 
 def _get_function_cfg(binary: str, func_name: str, max_blocks: int = 40) -> str:
-    """Return ASCII control-flow graph for a function using radare2 agfd."""
+    """Return control-flow graph for a function using radare2.
+
+    Strategy:
+    1. Seek to the function (s <func>) then print with agf (ASCII boxes).
+       agft is broken in batch/headless mode; seek+agf works reliably.
+    2. Try multiple symbol prefixes: bare name, sym., dbg., fcn., sub.
+    3. Fall back to agfd (graphviz dot) if agf still returns nothing —
+       dot format is less pretty but still maps the block structure.
+    """
     import shlex as _shlex
     binary_q = _shlex.quote(binary)
-    # agft = ASCII graph of function (text); agfd = dotfile; use agft for terminal-readable output
-    target = func_name if func_name.startswith(("0x", "sym.", "fcn.", "sub.")) else f"sym.{func_name}"
-    # agft @ <func> prints the CFG as ASCII boxes
-    cmd = f'aaa;agft @ {target}'
-    cmd_escaped = cmd.replace('"', '\\"')
-    result = _shell_exec(f'r2 -q -e scr.color=0 -e graph.maxdepth={max_blocks} -c "{cmd_escaped};q" {binary_q} 2>/dev/null', timeout=60)
-    if not result.strip():
-        # Fallback: try bare name
-        cmd2 = f'aaa;agft @ {func_name}'
-        cmd2_escaped = cmd2.replace('"', '\\"')
-        result = _shell_exec(f'r2 -q -e scr.color=0 -e graph.maxdepth={max_blocks} -c "{cmd2_escaped};q" {binary_q} 2>/dev/null', timeout=60)
-    if not result.strip():
-        return f"[get_function_cfg] CFG empty for '{func_name}'. Use r2_analyze with 'aaa;agft @ {func_name}' or check the function name with 'afl'."
-    # Limit output length so huge CFGs don't blow context
+
+    def _try(target: str) -> str:
+        # seek to function then print CFG; agf uses Unicode box chars but works in batch
+        cmd = f'aaa;s {target};agf'
+        cmd_esc = cmd.replace('"', '\\"')
+        return _shell_exec(
+            f'r2 -q -e scr.color=0 -e graph.maxdepth={max_blocks} -c "{cmd_esc};q" {binary_q} 2>/dev/null',
+            timeout=60,
+        )
+
+    # Try candidate names in order
+    candidates = [func_name]
+    if not func_name.startswith(("0x", "sym.", "fcn.", "sub.", "dbg.")):
+        candidates = [f"sym.{func_name}", f"dbg.{func_name}", f"fcn.{func_name}", func_name]
+
+    result = ""
+    for candidate in candidates:
+        result = _try(candidate)
+        # strip noise lines and check if we got actual graph content
+        clean = "\n".join(l for l in result.splitlines() if not l.startswith("[CWD") and "exit 0" not in l)
+        if clean.strip():
+            result = clean
+            break
+    else:
+        # Final fallback: agfd (dot format) — shows block structure even without graphics
+        cmd_dot = f'aaa;s {candidates[0]};agfd'
+        cmd_dot_esc = cmd_dot.replace('"', '\\"')
+        result = _shell_exec(
+            f'r2 -q -e scr.color=0 -c "{cmd_dot_esc};q" {binary_q} 2>/dev/null',
+            timeout=60,
+        )
+        clean = "\n".join(l for l in result.splitlines() if not l.startswith("[CWD") and "exit 0" not in l)
+        if not clean.strip():
+            return (
+                f"[get_function_cfg] Could not generate CFG for '{func_name}'. "
+                f"Check function exists with r2_analyze(binary, 'aaa;afl') and use the exact name shown."
+            )
+        result = f"[DOT format — paste into graphviz or read block labels directly]\n{clean}"
+        return f"[CFG: {func_name}]\n{result}"
+
+    # Limit output so huge CFGs don't blow context
     lines = result.splitlines()
     if len(lines) > 300:
-        result = "\n".join(lines[:300]) + f"\n... [{len(lines)-300} lines truncated — use max_blocks to reduce]"
+        result = "\n".join(lines[:300]) + f"\n... [{len(lines)-300} lines truncated — reduce max_blocks or decompile_function for specific blocks]"
     return f"[CFG: {func_name}]\n{result}"
 
 
