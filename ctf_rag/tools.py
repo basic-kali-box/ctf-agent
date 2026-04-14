@@ -687,18 +687,21 @@ TOOL_SCHEMAS.append({
         "Run an arbitrary sequence of GDB commands against a binary in a single batch session. "
         "Replaces gdb_analyze for any non-trivial debugging: set breakpoints, examine memory, "
         "inspect registers mid-execution, call functions, patch bytes, and continue — all in one shot. "
+        "PIE-aware: for PIE binaries (stripped ELFs, most CTF crackmes), just pass the r2/Ghidra "
+        "offset as the break address (e.g. 'break *0x1234'). The tool auto-detects PIE, runs starti "
+        "to get the real load base, prints '[PIE base = 0x...]', sets $base, and rewrites your "
+        "breakpoints to *($base + offset) automatically. "
         "gdb_commands is a list of GDB command strings executed in order. "
-        "The session captures all GDB output and returns it. "
         "Examples:\n"
-        "  # Catch crash and inspect stack\n"
+        "  # PIE binary — just use r2 offset, base is handled automatically\n"
+        "  gdb_script(binary='./chall',\n"
+        "    gdb_commands=['break *0x11ad', 'continue', 'info registers', 'x/20gx $rsp'])\n"
+        "  # Non-PIE: same usage, no adjustment needed\n"
         "  gdb_script(binary='./chall', stdin_input='A'*200,\n"
         "    gdb_commands=['run', 'info registers', 'x/20gx $rsp', 'backtrace'])\n"
-        "  # Breakpoint at specific address, inspect state\n"
-        "  gdb_script(binary='./chall', args=['solve'],\n"
-        "    gdb_commands=['break *0x401234', 'run', 'info registers', 'x/s $rdi', 'continue'])\n"
-        "  # Find offset by catching SIGSEGV\n"
-        "  gdb_script(binary='./chall', stdin_input='AAAABBBBCCCCDDDD',\n"
-        "    gdb_commands=['run', 'p/x $rip', 'p/x $rbp'])"
+        "  # Dump decrypted buffer after mmap self-modifying code executes\n"
+        "  gdb_script(binary='./chall',\n"
+        "    gdb_commands=['break *0x1331', 'continue', 'x/100xb $rax', 'x/10i $rax'])"
     ),
     "parameters": {
         "type": "object",
@@ -1701,14 +1704,32 @@ def _gdb_script(
 ) -> str:
     """
     Run a GDB batch session with arbitrary commands.
-    Much more powerful than gdb_analyze — supports breakpoints, memory inspection,
-    stepping, calling functions, and reading registers at any point.
+
+    PIE handling: if the binary is a PIE (Position Independent Executable),
+    addresses like 0x1234 are offsets from the load base. This function
+    auto-detects PIE and prepends a `starti` step that reads the actual base
+    from /proc/<pid>/maps, then rewrites any bare hex breakpoints in
+    gdb_commands to base+offset form so they resolve correctly.
+
+    For the agent: you can safely pass r2/Ghidra offsets (e.g. '0x1234')
+    as break addresses — they will be adjusted automatically for PIE binaries.
+    Non-PIE addresses are passed through unchanged.
     """
     import shlex as _shlex
-    import tempfile, os, textwrap
+    import tempfile, os
 
     if not gdb_commands:
         return "[error] gdb_script requires at least one gdb_command."
+
+    # Detect PIE: check ELF type (ET_DYN = PIE, ET_EXEC = non-PIE)
+    is_pie = False
+    try:
+        with open(binary, "rb") as f:
+            f.seek(16)  # e_type offset
+            e_type = int.from_bytes(f.read(2), "little")
+            is_pie = (e_type == 3)  # ET_DYN
+    except Exception:
+        pass
 
     binary_q = _shlex.quote(binary)
     arg_str = " ".join(_shlex.quote(a) for a in (args or []))
@@ -1717,7 +1738,6 @@ def _gdb_script(
     stdin_file = ""
     if stdin_input:
         with tempfile.NamedTemporaryFile(mode="wb", suffix=".bin", delete=False) as f:
-            # Support Python escape sequences in stdin_input
             try:
                 payload = bytes(stdin_input, "utf-8").decode("unicode_escape").encode("latin-1")
             except Exception:
@@ -1725,28 +1745,58 @@ def _gdb_script(
             f.write(payload)
             stdin_file = f.name
 
-    # Build GDB script file
-    script_lines = ["set pagination off", "set confirm off"]
-    if stdin_file:
-        script_lines.append(f"set args {arg_str}")
-        # Redirect stdin for `run`
-        run_redir = f"< {stdin_file}"
-    else:
-        script_lines.append(f"set args {arg_str}")
-        run_redir = ""
+    run_redir = f"< {stdin_file}" if stdin_file else ""
 
-    for cmd in gdb_commands:
-        # Inject stdin redirect into `run` commands automatically
-        if cmd.strip().lower().startswith("run") and run_redir and run_redir not in cmd:
-            script_lines.append(f"{cmd} {run_redir}")
-        else:
-            script_lines.append(cmd)
+    # Build GDB script
+    script_lines = ["set pagination off", "set confirm off", f"set args {arg_str}"]
+
+    if is_pie:
+        # Use starti to stop at the very first instruction, read the base, then
+        # set a convenience variable $base so the agent's commands can use it.
+        # We also rewrite literal hex addresses in break/watch commands.
+        script_lines += [
+            "starti",
+            # Read load base from the first executable mapping
+            "python import subprocess, re, gdb",
+            "python pid = gdb.selected_inferior().pid",
+            "python maps = open(f'/proc/{pid}/maps').read()",
+            # Find the mapping at file offset 0 (r--p 00000000) — that IS the ELF file base.
+            # r2 offsets are from this base, not from the code segment.
+            r"python m = re.search(r'([0-9a-f]+)-[0-9a-f]+ r--p 00000000[^\n]*' + re.escape(gdb.current_progspace().filename), maps)",
+            "python base = int(m.group(1), 16) if m else 0",
+            "python gdb.execute(f'set $base = {base}')",
+            "python print(f'[PIE base = {hex(base)}]')",
+        ]
+        # Rewrite bare hex breakpoints: `break *0x1234` → `break *($base + 0x1234)`
+        # (only if the address looks like a typical PIE offset, i.e. < 0x10000000)
+        import re as _re
+        processed = []
+        for cmd in gdb_commands:
+            m = _re.match(r'^(break|b|watch|rwatch|awatch)\s+\*?(0x[0-9a-fA-F]+)\s*$', cmd.strip())
+            if m and int(m.group(2), 16) < 0x10000000:
+                processed.append(f"{m.group(1)} *($base + {m.group(2)})")
+            elif cmd.strip().lower().startswith("run") and run_redir and run_redir not in cmd:
+                processed.append(f"{cmd} {run_redir}")
+            else:
+                processed.append(cmd)
+        script_lines += processed
+    else:
+        for cmd in gdb_commands:
+            if cmd.strip().lower().startswith("run") and run_redir and run_redir not in cmd:
+                script_lines.append(f"{cmd} {run_redir}")
+            else:
+                script_lines.append(cmd)
 
     script_lines.append("quit")
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".gdb", delete=False) as f:
         f.write("\n".join(script_lines) + "\n")
         script_file = f.name
+
+    if is_pie:
+        header = f"[PIE binary — auto-adjusted breakpoints, $base set at runtime]\n"
+    else:
+        header = ""
 
     try:
         result = _shell_exec(
@@ -1763,7 +1813,7 @@ def _gdb_script(
 
     if not result.strip():
         return "[gdb_script] No output returned. Check the binary path and GDB commands."
-    return result
+    return header + result
 
 
 def _sandboxed_exec(code: str, tool_name: str, session=None) -> str:
